@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# View (mutually exclusive; last one wins)
+VIEW="default"   # default | todo | mine | waiting | all
+
+# Flags
+DEPTH=0
+JSON=false
+
+usage() {
+  cat <<EOF
+gh-reviews v${VERSION} — a read-only PR heat check across your repos
+
+USAGE
+  gh reviews [view] [flags]
+
+The default view is a heat check on your work in progress, split into two
+sections: what needs you, and your PRs that are parked on someone else.
+
+Scope follows your current directory: depth 0 is the current repo, and --depth N
+cascades N levels into subprojects. cd into a project to scope it there.
+
+VIEWS
+  (default)   Heat check: reviews you owe + all your open PRs, grouped into
+              "Needs you" and "Waiting on others"
+  todo        Reviews you owe — your review is requested (you or your team), OR
+              you left feedback and the author has pushed since (re-review)
+  mine        Your PRs needing your action — changes requested, new feedback to
+              address, or approved and ready to merge
+  waiting     Your PRs parked on others — pushed and waiting on reviewers
+  all         Team-wide: any PR stalled waiting on its author
+
+ROLES (shown in the ROLE column)
+  review      someone requested your review
+  re-review   you reviewed, the author has pushed since
+  address     your PR has changes requested or new feedback
+  approved    your PR is approved — your move (CI/mergeability not checked)
+  nudge       your PR has no reviewers and no activity — needs a nudge
+  waiting     your PR is waiting on reviewers
+  stalled     someone else's PR is waiting on its author
+
+FLAGS
+  --depth N   How many directory levels to walk for repos (default: 0, current repo)
+  --json      Emit matched PRs as a JSON array instead of a table
+  --version   Print version
+  --help      Show this help
+
+EXAMPLES
+  gh reviews                  # heat check of the current repo
+  gh reviews --depth 1        # heat check across every repo one level down
+  gh reviews todo             # just the reviews you owe
+  gh reviews mine --depth 1   # your PRs needing action, across repos
+  gh reviews waiting          # your PRs parked on reviewers
+  gh reviews all --depth 1    # every PR stalled on its author
+  gh reviews todo --json | jq # machine-readable, for scripting
+EOF
+}
+
+# Parse view (first positional argument)
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    todo)    VIEW="todo"; shift ;;
+    mine)    VIEW="mine"; shift ;;
+    waiting) VIEW="waiting"; shift ;;
+    all)     VIEW="all"; shift ;;
+    -*) ;;  # flag, not a view — leave for flag parsing
+    *)
+      echo "Unknown view: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+fi
+
+# Parse flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --depth)
+      if [[ -z "${2:-}" || ! "${2:-}" =~ ^[0-9]+$ ]]; then
+        echo "error: --depth requires a numeric argument" >&2
+        exit 1
+      fi
+      DEPTH="$2"; shift 2 ;;
+    --json)    JSON=true; shift ;;
+    --version) echo "gh-reviews v${VERSION}"; exit 0 ;;
+    --help|-h) usage; exit 0 ;;
+    *)
+      echo "Unknown flag: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+check_dependencies() {
+  if ! command -v gh &>/dev/null; then
+    echo "error: gh (GitHub CLI) is required but not installed" >&2
+    exit 1
+  fi
+  if ! command -v jq &>/dev/null; then
+    echo "error: jq is required but not installed" >&2
+    exit 1
+  fi
+}
+
+discover_repos() {
+  if [[ "$DEPTH" -eq 0 ]]; then
+    if git rev-parse --is-inside-work-tree &>/dev/null; then
+      printf '%s\n' "$(git rev-parse --show-toplevel)"
+    else
+      echo "No git repos found in $(pwd)" >&2
+      exit 1
+    fi
+    return
+  fi
+
+  local repos=()
+  local seen=""
+
+  # Include the current repo itself, if we're in one — "this repo + subprojects".
+  local cur_top
+  if cur_top="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    seen+=$'\n'"$cur_top"$'\n'
+    repos+=("$cur_top")
+  fi
+
+  # Match .git directories AND .git files (worktrees, submodules), then resolve
+  # each to its working-tree root and de-duplicate.
+  while IFS= read -r gitpath; do
+    local dir top
+    dir="$(dirname "$gitpath")"
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || continue
+    case "$seen" in *$'\n'"$top"$'\n'*) continue ;; esac
+    seen+=$'\n'"$top"$'\n'
+    repos+=("$top")
+  done < <(find . -mindepth 2 -maxdepth "$((DEPTH + 1))" -name .git 2>/dev/null | sort)
+
+  if [[ ${#repos[@]} -eq 0 ]]; then
+    echo "No git repos found in $(pwd)" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "${repos[@]}"
+}
+
+# Resolve a working tree to its GitHub "owner/repo" by parsing its remotes
+# locally — no API call, so rate limits can't masquerade as "not a GitHub
+# repo." Prefers the `upstream` remote (the canonical repo in the standard
+# fork workflow, where your PRs and review requests actually live) and falls
+# back to `origin`. Prints owner/repo on success; returns non-zero otherwise.
+repo_slug() {
+  local dir="$1" url path remote
+  for remote in upstream origin; do
+    url="$(git -C "$dir" remote get-url "$remote" 2>/dev/null)" || continue
+    url="${url%.git}"
+    case "$url" in *github.com[:/]*) ;; *) continue ;; esac
+    path="${url#*github.com}"
+    path="${path#[:/]}"
+    [[ "$path" == */* ]] && { printf '%s\n' "$path"; return 0; }
+  done
+  return 1
+}
+
+# GraphQL query for one page of a repo's open PRs. $cursor paginates.
+PR_QUERY='
+  query($owner:String!,$repo:String!,$cursor:String){
+    repository(owner:$owner,name:$repo){
+      pullRequests(states:OPEN,first:50,after:$cursor){
+        pageInfo{ hasNextPage endCursor }
+        nodes{
+          number title isDraft reviewDecision
+          author{login}
+          commits(last:1){ nodes{ commit{ committedDate } } }
+          reviews(last:50){ nodes{ author{login __typename} submittedAt state } }
+          comments(last:50){ nodes{ author{login __typename} createdAt } }
+          reviewThreads(last:50){ nodes{ isResolved comments(last:5){ nodes{ author{login __typename} createdAt } } } }
+          reviewRequests(first:50){ nodes{ requestedReviewer{ __typename ... on User{login} ... on Team{name combinedSlug} } } }
+        }
+      }
+    }
+  }'
+
+# jq program: given $me, $view, $repo, $myteams (array of "org/slug"), transform
+# a page of PRs into one compact JSON object per matched PR. Classifies each PR
+# by who the ball is on (role) and which heat-check section it belongs to
+# (bucket: "you" = needs you, "others" = waiting on someone else).
+JQ_PROGRAM='
+  .data.repository.pullRequests.nodes[]
+  | (.commits.nodes[0].commit.committedDate) as $lc
+  | .author.login as $auth
+  # Human activity by someone other than the author, since the last commit.
+  # "actionable" = something the author must respond to: a comment in an
+  # unresolved thread, a general PR comment, or a review whose LATEST verdict
+  # per reviewer (after the last commit) requested changes / left remarks. A bare
+  # approval — or a later approval that supersedes an earlier objection — is not.
+  | ([ .reviews.nodes[]
+        | select(.author.__typename=="User" and .author.login!=$auth
+                 and $lc!=null and .submittedAt>$lc) ]
+     | group_by(.author.login) | map(max_by(.submittedAt))
+     | map({who:.author.login, ts:.submittedAt,
+            actionable:(.state=="CHANGES_REQUESTED" or .state=="COMMENTED")})) as $reviewItems
+  | ([ (.comments.nodes[]       | {who:.author.login, t:.author.__typename, ts:.createdAt}),
+       (.reviewThreads.nodes[] | select(.isResolved|not) | .comments.nodes[]
+                                | {who:.author.login, t:.author.__typename, ts:.createdAt}) ]
+     | map(select(.t=="User" and .who!=$auth and $lc!=null and .ts>$lc))
+     | map({who:.who, ts:.ts, actionable:true})) as $commentItems
+  | ($reviewItems + $commentItems) as $after
+  | ([$after[] | select(.actionable)]) as $actionable
+  | (($actionable|length)>0) as $hasActionable
+  # Pending review requests: am I asked, directly or via a team I belong to?
+  | ([.reviewRequests.nodes[].requestedReviewer | select(.__typename=="User") | .login]) as $reqUsers
+  | ([.reviewRequests.nodes[].requestedReviewer | select(.__typename=="Team") | .combinedSlug]) as $reqTeams
+  | (($reqUsers | index($me)) != null) as $awaitingMeUser
+  | ([$reqTeams[] | select(($myteams | index(.)) != null)] | length > 0) as $awaitingMeTeam
+  # You never review your own PR — exclude author-owned PRs so a team request on
+  # your own PR is treated as "waiting on others", not "review".
+  | (($awaitingMeUser or $awaitingMeTeam) and ($auth != $me)) as $awaitingMe
+  # Display string for who a PR is currently waiting on (pending reviewers).
+  | ([.reviewRequests.nodes[].requestedReviewer
+       | if .__typename=="User" then .login elif .__typename=="Team" then ("@"+.combinedSlug) else empty end]
+     | unique | join(",")) as $reqDisplay
+  # My most recent submitted review on this PR.
+  | (.reviews.nodes | map(select(.author.login==$me and .submittedAt!=null)) | sort_by(.submittedAt) | last) as $myLastRev
+  # Re-review needed: I reviewed (any verdict — approval included, since a stale
+  # approval after new commits is exactly "you reviewed, they pushed since") and
+  # the author has pushed commits since, even if they never re-requested me.
+  | ($myLastRev != null
+      and ($myLastRev.state=="CHANGES_REQUESTED" or $myLastRev.state=="COMMENTED" or $myLastRev.state=="APPROVED")
+      and $lc != null and ($lc > $myLastRev.submittedAt)
+      and ($auth != $me) and (.isDraft|not)) as $needsReReview
+  | (.author.login==$me) as $mine
+  | (if .isDraft then "DRAFT"
+     elif .reviewDecision then .reviewDecision
+     else "NONE" end) as $state
+  # Who is the ball on?
+  | (if   $awaitingMe   then "review"
+      elif $needsReReview then "re-review"
+      elif ($mine and (.isDraft|not)) then
+        # "address" is driven by actionable feedback *after* your last commit, not
+        # the raw reviewDecision — once you push fixes, a prior changes-requested
+        # review no longer keeps the PR in "Needs you". Fresh feedback also wins
+        # over a prior approval.
+        (if   $hasActionable then "address"
+          elif $state=="APPROVED" then "approved"
+          elif (($reqUsers|length)>0 or ($reqTeams|length)>0) then "waiting"
+          else "nudge" end)
+      elif $hasActionable then "stalled"
+      else "none" end) as $role
+  | (if ($role=="waiting" or $role=="stalled") then "others" else "you" end) as $bucket
+  | (if   $view=="todo"    then ($role=="review" or $role=="re-review")
+      elif $view=="mine"    then ($role=="address" or $role=="approved" or $role=="nudge")
+      elif $view=="waiting" then ($role=="waiting")
+      elif $view=="all"     then ($hasActionable and $role!="none")
+      else (($role=="review" or $role=="re-review") or ($mine and (.isDraft|not))) end) as $keep
+  | select($keep)
+  | {
+      repo: $repo,
+      number: .number,
+      title: .title,
+      author: $auth,
+      state: $state,
+      role: $role,
+      bucket: $bucket,
+      lastCommit: ($lc // ""),
+      who: (if ($role=="review" or $role=="re-review") then $auth
+            elif $role=="waiting" then $reqDisplay
+            elif (($actionable|length)>0) then ([$actionable[].who]|unique|join(","))
+            else "" end),
+      latest: ([$actionable[].ts]|max // ""),
+      mine: $mine,
+      awaitingMe: $awaitingMe,
+      needsReReview: $needsReReview
+    } | @json
+'
+
+# Per-repo: emit one compact JSON object per matched PR (one per line), paging
+# through every open PR. Args: <owner/repo> <me> <myteams-json>. Returns 0 on
+# success (incl. zero matches), 2 when the repo could not be queried.
+fetch_repo() {
+  local owner_repo="$1" me="$2" myteams="$3"
+  local owner="${owner_repo%%/*}" repo="${owner_repo##*/}"
+  local cursor="" resp hasNext
+
+  while :; do
+    # Fetch raw, then transform ourselves so GraphQL error envelopes
+    # (e.g. RATE_LIMITED) can't leak through as fake PR rows.
+    if [[ -z "$cursor" ]]; then
+      resp="$(gh api graphql -f query="$PR_QUERY" -f owner="$owner" -f repo="$repo" -F cursor=null 2>/dev/null)" || true
+    else
+      resp="$(gh api graphql -f query="$PR_QUERY" -f owner="$owner" -f repo="$repo" -f cursor="$cursor" 2>/dev/null)" || true
+    fi
+
+    if [[ -z "$resp" ]] || jq -e '.errors' <<<"$resp" >/dev/null 2>&1; then
+      local msg
+      msg="$(jq -r '.errors[0].message // "request failed"' <<<"$resp" 2>/dev/null)" || msg="request failed"
+      # Always surface failures, even in --json mode, so automation can't mistake
+      # a rate limit or query error for "no PRs".
+      echo "  warning: ${owner}/${repo}: ${msg}" >&2
+      return 2
+    fi
+
+    local page_out
+    if ! page_out="$(jq -r --arg me "$me" --arg view "$VIEW" --arg repo "$repo" --argjson myteams "$myteams" \
+                       "$JQ_PROGRAM" <<<"$resp" 2>/dev/null)"; then
+      # A jq runtime error must not silently drop a repo's PRs — fail loudly.
+      echo "  warning: ${owner}/${repo}: failed to parse PR data" >&2
+      return 2
+    fi
+    [[ -n "$page_out" ]] && printf '%s\n' "$page_out"
+
+    hasNext="$(jq -r '.data.repository.pullRequests.pageInfo.hasNextPage' <<<"$resp" 2>/dev/null)" || hasNext=false
+    [[ "$hasNext" == "true" ]] || break
+    cursor="$(jq -r '.data.repository.pullRequests.pageInfo.endCursor' <<<"$resp" 2>/dev/null)" || break
+    [[ -z "$cursor" || "$cursor" == "null" ]] && break
+  done
+}
+
+# Render collected JSON lines (TSV, sorted, bucket-first) as a sectioned,
+# colorized table with a header per section.
+render_table() {
+  awk -F'\t' -v istty="$1" '
+    function color(state,   c) {
+      if (!use_color) return state
+      if (state=="APPROVED")               c="32"   # green
+      else if (state=="CHANGES_REQUESTED") c="31"   # red
+      else if (state=="REVIEW_REQUIRED")   c="33"   # yellow
+      else                                 c="2"    # dim
+      return "\033[" c "m" state "\033[0m"
+    }
+    function header() {
+      printf "%-15s %-5s %-17s %-9s %-17s %-18s %-17s %s\n", \
+             "REPO","PR","STATE","ROLE","LAST-COMMIT","WHO","LATEST","TITLE"
+    }
+    BEGIN { use_color = (ENVIRON["NO_COLOR"]=="" && istty=="1"); cur="" }
+    {
+      bucket=$1; repo=$2; num=$3; state=$4; role=$5; lc=$6; who=$7; latest=$8; title=$9
+      if (bucket != cur) {
+        if (cur != "") printf "\n"
+        printf "%s\n", (bucket=="you" ? "▶ Needs you" : "▶ Waiting on others")
+        header()
+        cur=bucket
+      }
+      # pad state to width first, then wrap color so columns stay aligned
+      padded=sprintf("%-17s", state); s=state; sub(/[ \t]+$/,"",s)
+      pad=substr(padded, length(s)+1)
+      printf "%-15s #%-4s %s%s %-9s %-17s %-18s %-17s %s\n", \
+             repo, num, color(s), pad, role, lc, substr(who,1,18), latest, title
+    }
+  '
+}
+
+main() {
+  check_dependencies
+
+  local me
+  me="$(gh api user --jq '.login' 2>/dev/null)" || {
+    echo "error: could not determine your GitHub login (are you logged in to gh?)" >&2
+    exit 1
+  }
+
+  # Teams I belong to, as "org/slug" — used to match team-routed review
+  # requests. Needs the token's read:org scope; degrades to direct-only if not.
+  local my_teams
+  my_teams="$(gh api --paginate user/teams --jq '.[] | .organization.login + "/" + .slug' 2>/dev/null \
+              | jq -R . | jq -s -c . 2>/dev/null)" || my_teams="[]"
+  [[ -z "$my_teams" ]] && my_teams="[]"
+
+  local repos=()
+  while IFS= read -r repo; do
+    repos+=("$repo")
+  done < <(discover_repos)
+
+  # Resolve each working tree to its GitHub owner/repo and de-duplicate, so
+  # multiple worktrees of the same repo are queried only once.
+  local targets=() seen=""
+  for repo in "${repos[@]}"; do
+    local info
+    info="$(repo_slug "$repo")" || {
+      echo "  Skipping $(basename "$repo") — no github.com upstream/origin remote" >&2
+      continue
+    }
+    case "$seen" in *$'\n'"$info"$'\n'*) continue ;; esac
+    seen+=$'\n'"$info"$'\n'
+    targets+=("$info")
+  done
+
+  # Repos were found but none were queryable (all skipped) — don't pretend we
+  # checked anything; that would read as a false "all clear".
+  if [[ ${#repos[@]} -gt 0 && ${#targets[@]} -eq 0 ]]; then
+    echo "error: no GitHub repos to check — all ${#repos[@]} discovered repo(s) lack a github.com upstream/origin remote" >&2
+    return 1
+  fi
+
+  # Collect all matched PRs as JSON lines; track whether any repo failed.
+  # Repos are queried concurrently (bounded pool) since the cost is network
+  # latency per repo; the cap stays modest to avoid GitHub's secondary limits.
+  local lines="" failed=false
+  if [[ ${#targets[@]} -gt 0 ]]; then
+    local tmpdir
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/gh-reviews.XXXXXX")"
+    local max=6 idx=0 batch=() n=${#targets[@]}
+    for info in "${targets[@]}"; do
+      { fetch_repo "$info" "$me" "$my_teams" >"$tmpdir/$idx.out" 2>"$tmpdir/$idx.err" \
+          || echo x >>"$tmpdir/failed"; } &
+      batch+=("$!")
+      idx=$((idx + 1))
+      if [[ ${#batch[@]} -ge $max ]]; then wait "${batch[@]}"; batch=(); fi
+    done
+    [[ ${#batch[@]} -gt 0 ]] && wait "${batch[@]}"
+
+    local j
+    for ((j = 0; j < n; j++)); do
+      [[ -s "$tmpdir/$j.err" ]] && cat "$tmpdir/$j.err" >&2
+      [[ -s "$tmpdir/$j.out" ]] && lines+="$(cat "$tmpdir/$j.out")"$'\n'
+    done
+    [[ -s "$tmpdir/failed" ]] && failed=true
+    rm -rf "$tmpdir"
+  fi
+
+  # Strip trailing blank line(s).
+  lines="$(printf '%s' "$lines" | sed '/^$/d')"
+
+  if [[ "$JSON" == true ]]; then
+    if [[ -z "$lines" ]]; then
+      echo "[]"
+    else
+      printf '%s\n' "$lines" | jq -s '.'
+    fi
+    [[ "$failed" == true ]] && return 1
+    return 0
+  fi
+
+  if [[ -z "$lines" ]]; then
+    # Don't claim "all clear" if we couldn't actually check everything.
+    if [[ "$failed" == true ]]; then
+      echo "No matches found, but some repos could not be queried (see warnings above) — results may be incomplete." >&2
+      return 1
+    fi
+    case "$VIEW" in
+      todo)    echo "Nothing waiting on your review — you're caught up." ;;
+      mine)    echo "None of your PRs need action." ;;
+      waiting) echo "None of your PRs are waiting on others." ;;
+      all)     echo "No PRs are stalled on their author." ;;
+      *)       echo "All clear — nothing needs you, nothing's waiting. 🎉" ;;
+    esac
+    return 0
+  fi
+
+  local you others
+  you="$(printf '%s\n' "$lines" | jq -s '[.[]|select(.bucket=="you")]|length')"
+  others="$(printf '%s\n' "$lines" | jq -s '[.[]|select(.bucket=="others")]|length')"
+
+  [[ "$VIEW" == "default" ]] && { echo "Heat check — ${you} need you · ${others} waiting on others"; echo; }
+
+  local istty=0
+  [[ -t 1 ]] && istty=1
+
+  # Sort "you" before "others", then by repo and PR number; bucket leads the TSV
+  # so render_table can break it into sections. Title last (may contain spaces).
+  printf '%s\n' "$lines" \
+    | jq -s -r 'sort_by((if .bucket=="you" then 0 else 1 end), .repo, .number)[]
+                | [.bucket, .repo, (.number|tostring), .state, .role,
+                   (.lastCommit[:16]), .who, (.latest[:16]), (.title[:50])] | @tsv' \
+    | render_table "$istty"
+
+  [[ "$failed" == true ]] && return 1
+  return 0
+}
+
+main

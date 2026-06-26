@@ -115,6 +115,10 @@ check "my PR, reviewer commented after push -> address/you" "address you" \
 check "my PR, reviewers pending, no feedback -> waiting/others" "waiting others" \
   "$(payload 10 me false '"REVIEW_REQUIRED"' "$LATE" '[]' "$REVIEW_ALICE" | classify me default '[]')"
 
+check "my PR, pending reviewer but reviewDecision null -> STATE=REVIEW_REQUIRED (not NONE)" "REVIEW_REQUIRED" \
+  "$(payload 101 me false null "$LATE" '[]' "$REVIEW_ALICE" \
+     | jq -r --arg me me --arg view default --arg repo demo --argjson myteams '[]' "$PROG" | jq -r '.state')"
+
 check "my PR, no reviewers, no activity -> nudge/you" "nudge you" \
   "$(payload 11 me false null "$LATE" '[]' '[]' | classify me default '[]')"
 

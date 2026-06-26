@@ -232,8 +232,11 @@ JQ_PROGRAM='
       and $lc != null and ($lc > $myLastRev.submittedAt)
       and ($auth != $me) and (.isDraft|not)) as $needsReReview
   | (.author.login==$me) as $mine
+  # reviewDecision is null when the repo does not *require* review — but a review
+  # can still be pending. Surface that as REVIEW_REQUIRED rather than NONE.
   | (if .isDraft then "DRAFT"
      elif .reviewDecision then .reviewDecision
+     elif (($reqUsers|length)>0 or ($reqTeams|length)>0) then "REVIEW_REQUIRED"
      else "NONE" end) as $state
   # Who is the ball on?
   | (if   $awaitingMe   then "review"
